@@ -39,10 +39,37 @@ export function runSecurityChecks({ run = spawnSync, log = console.log } = {}) {
 
   // Keep the pinned scanner in default text mode. Its JSON mode can exit zero
   // with findings, so JSON/progress/partial output is not accepted as success.
+  const goEnv = {
+    ...process.env,
+    // `go run` builds the scanner first; the build toolchain must satisfy x/vuln's
+    // own go.mod, which is independent of agent/go.mod. Keep auto so a runner whose
+    // installed Go is older than that requirement can still fetch the right one.
+    GOTOOLCHAIN: process.env.GOTOOLCHAIN || 'auto',
+  };
   const go = run('go', ['run', 'golang.org/x/vuln/cmd/govulncheck@v1.7.0', './...'], {
-    cwd: join(root, 'agent'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: join(root, 'agent'), env: goEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 300000, maxBuffer: 16 * 1024 * 1024,
   });
+  if (go.error || go.status !== 0) {
+    // Previously only one of stderr/stdout surfaced via `stderr || stdout`, which
+    // hid the scanner's own findings. Print the whole scene so a failure is
+    // diagnosable from the CI log alone. This adds detail only: the gate below
+    // still fails on any non-zero exit or unclean text scan.
+    const gv = run('go', ['version'], { cwd: join(root, 'agent'), env: goEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+    const lines = [
+      `govulncheck did not exit cleanly.`,
+      `  go run exit code : ${go.status ?? 'unavailable'}`,
+      `  go run signal    : ${go.signal ?? '(none)'}`,
+      `  go version       : ${(gv.stdout || gv.stderr || 'unavailable').trim()}`,
+      `  GOTOOLCHAIN      : ${goEnv.GOTOOLCHAIN}`,
+      `----- govulncheck stdout -----`,
+      (go.stdout || '(empty)').trim(),
+      `----- govulncheck stderr -----`,
+      (go.stderr || '(empty)').trim(),
+      go.error ? `----- spawn error -----\n${go.error.message}` : '',
+    ];
+    throw new Error(lines.filter(Boolean).join('\n').slice(0, 12000));
+  }
   requireSuccessfulScan('govulncheck', go);
   if (go.stdout.trim() !== 'No vulnerabilities found.') {
     throw new Error(`govulncheck did not return a complete clean text scan:\n${go.stdout.trim().slice(0, 12000)}`);
